@@ -253,6 +253,18 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await session.start(**_session_kwargs)
     await _log("info", "Agent session started — AI ready")
 
+    @session.on("agent_started_speaking")
+    def _on_agent_start():
+        logger.info("AGENT started speaking")
+
+    @session.on("agent_stopped_speaking")
+    def _on_agent_stop():
+        logger.info("AGENT stopped speaking")
+
+    @session.on("user_started_speaking")
+    def _on_user_start():
+        logger.info("USER started speaking (detected by VAD)")
+
     # ── Optional S3 recording ────────────────────────────────────────────────
     if phone_number:
         _aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -279,19 +291,30 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             except Exception as _exc:
                 await _log("warning", f"Recording start failed (non-fatal): {_exc}")
 
-    # ── Greeting ─────────────────────────────────────────────────────────────
-    _active_model = os.getenv("GEMINI_MODEL", "")
-    if "3.1" in _active_model or "2.5" in _active_model:
-        await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
-    else:
-        greeting = (
-            f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
-            if phone_number else "Greet the caller warmly."
-        )
-        try:
-            await session.generate_reply(instructions=greeting)
-        except Exception as _gr_exc:
-            await _log("warning", f"generate_reply failed: {_gr_exc}")
+    # ── Greeting & Audio Debug ───────────────────────────────────────────────
+    def _on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info("SUBSCRIBED to audio track from %s (%s)", participant.identity, participant.kind)
+
+    ctx.room.on("track_subscribed", _on_track_subscribed)
+
+    # Check for existing audio tracks
+    for p in ctx.room.remote_participants.values():
+        for pub in p.track_publications.values():
+            if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info("ALREADY subscribed to audio from %s", p.identity)
+
+    # Always force a greeting turn to ensure the audio path is 'warmed up'
+    await asyncio.sleep(0.5)
+    greeting = (
+        f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
+        if phone_number else "Hello? Can you hear me? Greet the caller warmly."
+    )
+    try:
+        await _log("info", "Requesting initial greeting turn...")
+        await session.generate_reply(instructions=greeting)
+    except Exception as _gr_exc:
+        await _log("warning", f"generate_reply failed: {_gr_exc}")
 
     # ── Keep session alive until SIP participant leaves ───────────────────────
     if phone_number:
