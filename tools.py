@@ -23,7 +23,7 @@ async def _log(msg: str, detail: str = "", level: str = "info") -> None:
         pass
 
 
-class AppointmentTools(llm.ToolContext):
+class AppointmentTools:
     """All function tools available to the appointment-booking agent."""
 
     def __init__(self, ctx: agents.JobContext, phone_number: Optional[str] = None, lead_name: Optional[str] = None):
@@ -33,7 +33,6 @@ class AppointmentTools(llm.ToolContext):
         self._call_start_time = time.time()
         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
         self.recording_url: Optional[str] = None
-        super().__init__(tools=[])
 
     def build_tool_list(self, enabled: list) -> list:
         """Return tool methods filtered by the enabled list. Empty list = all enabled."""
