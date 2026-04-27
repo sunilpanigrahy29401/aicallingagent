@@ -290,14 +290,35 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     @session.on("agent_started_speaking")
     def _on_agent_start():
         logger.info("AGENT started speaking")
+        _last_activity[0] = asyncio.get_event_loop().time()
 
     @session.on("agent_stopped_speaking")
     def _on_agent_stop():
         logger.info("AGENT stopped speaking")
+        _last_activity[0] = asyncio.get_event_loop().time()
 
     @session.on("user_started_speaking")
     def _on_user_start():
         logger.info("USER started speaking (detected by VAD)")
+        _last_activity[0] = asyncio.get_event_loop().time()
+
+    # ── Inactivity watchdog — auto-hangup if both sides go silent ────────────
+    _last_activity = [asyncio.get_event_loop().time()]
+    _INACTIVITY_TIMEOUT = 30  # seconds of total silence before auto-disconnect
+
+    async def _inactivity_watchdog():
+        while True:
+            await asyncio.sleep(5)
+            elapsed = asyncio.get_event_loop().time() - _last_activity[0]
+            if elapsed >= _INACTIVITY_TIMEOUT:
+                await _log("warning", f"Inactivity timeout ({_INACTIVITY_TIMEOUT}s) — auto-disconnecting call")
+                try:
+                    await ctx.room.disconnect()
+                except Exception:
+                    pass
+                return
+
+    _watchdog_task = asyncio.create_task(_inactivity_watchdog())
 
     # ── Optional S3 recording ────────────────────────────────────────────────
     if phone_number:
@@ -404,6 +425,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             await _log("warning", "Call reached 1-hour safety timeout")
 
         await _log("info", f"SIP participant disconnected — ending session for {phone_number}")
+        _watchdog_task.cancel()
         await session.aclose()
     else:
         _done = asyncio.Event()
