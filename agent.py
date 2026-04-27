@@ -101,6 +101,27 @@ except ImportError:
 
 # ── Session factory ──────────────────────────────────────────────────────────
 
+# Models that support the Gemini Live/Realtime API (audio-to-audio).
+# Non-live models (e.g. gemini-2.0-flash-exp) will SILENTLY FAIL.
+_DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
+_LIVE_MODEL_KEYWORDS = ("live",)  # model name must contain one of these
+
+
+def _ensure_live_model(model: str) -> str:
+    """Auto-correct non-live model names to prevent silent failures."""
+    if any(kw in model.lower() for kw in _LIVE_MODEL_KEYWORDS):
+        return model
+    logger.error(
+        "MODEL '%s' is NOT a Live/Realtime model! "
+        "Realtime API requires a model with 'live' in the name. "
+        "Auto-correcting to '%s'. "
+        "Fix your GEMINI_MODEL env var to one of: "
+        "gemini-2.0-flash-live, gemini-2.5-flash-live-preview, gemini-3.1-flash-live-preview",
+        model, _DEFAULT_LIVE_MODEL,
+    )
+    return _DEFAULT_LIVE_MODEL
+
+
 def _build_session(
     tools: list,
     system_prompt: str,
@@ -115,6 +136,8 @@ def _build_session(
     RealtimeClass = _google_realtime or (_google_beta_realtime if use_realtime else None)
 
     if use_realtime and RealtimeClass is not None:
+        # CRITICAL: Validate that the model supports the Live API
+        gemini_model = _ensure_live_model(gemini_model)
         logger.info("SESSION MODE: Gemini Live realtime (%s, voice=%s)", gemini_model, gemini_voice)
         try:
             from google.genai import types as _gt
@@ -253,8 +276,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
         )
 
-    await session.start(**_session_kwargs)
-    await _log("info", "Agent session started — AI ready")
+    try:
+        await session.start(**_session_kwargs)
+        await _log("info", "Agent session started — AI ready")
+    except Exception as _start_exc:
+        await _log("error", f"session.start() FAILED: {_start_exc}")
+        ctx.shutdown()
+        return
+
+    # Give the realtime session time to fully initialize its audio pipeline
+    await asyncio.sleep(1.0)
 
     @session.on("agent_started_speaking")
     def _on_agent_start():
