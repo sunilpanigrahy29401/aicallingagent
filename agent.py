@@ -101,10 +101,15 @@ except ImportError:
 
 # ── Session factory ──────────────────────────────────────────────────────────
 
-def _build_session(tools: list, system_prompt: str) -> AgentSession:
+def _build_session(
+    tools: list,
+    system_prompt: str,
+    voice_override: str = None,
+    model_override: str = None,
+) -> AgentSession:
     """Build AgentSession with Gemini Live or pipeline fallback."""
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
-    gemini_voice = os.getenv("GEMINI_TTS_VOICE", "Aoede")
+    gemini_model = model_override or os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+    gemini_voice = voice_override or os.getenv("GEMINI_TTS_VOICE", "Aoede")
     use_realtime = os.getenv("USE_GEMINI_REALTIME", "true").lower() != "false"
 
     RealtimeClass = _google_realtime or (_google_beta_realtime if use_realtime else None)
@@ -160,8 +165,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     phone_number: Optional[str] = None
     lead_name = "there"
-    business_name = "our company"
-    service_type = "our service"
+    business_name = "Aditya Crop Care"
+    service_type = "Humic Flakes"
     custom_prompt: Optional[str] = None
     voice_override: Optional[str] = None
     model_override: Optional[str] = None
@@ -186,11 +191,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     system_prompt = build_prompt(lead_name=lead_name, business_name=business_name,
                                   service_type=service_type, custom_prompt=custom_prompt)
     tool_ctx = AppointmentTools(ctx, phone_number, lead_name)
-
-    if voice_override:
-        os.environ["GEMINI_TTS_VOICE"] = voice_override
-    if model_override:
-        os.environ["GEMINI_MODEL"] = model_override
 
     if tools_override:
         try:
@@ -233,7 +233,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await _log("info", f"Building AI session — model={gemini_model}")
     active_tools = tool_ctx.build_tool_list(enabled_tools)
     await _log("info", f"Tools loaded: {[t.__name__ for t in active_tools]}")
-    session = _build_session(tools=active_tools, system_prompt=system_prompt)
+    session = _build_session(
+        tools=active_tools, system_prompt=system_prompt,
+        voice_override=voice_override, model_override=model_override,
+    )
 
     # NEVER use close_on_disconnect=True with SIP
     if _HAS_ROOM_OPTIONS:
@@ -292,9 +295,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 await _log("warning", f"Recording start failed (non-fatal): {_exc}")
 
     # ── Greeting & Audio Debug ───────────────────────────────────────────────
+    _audio_ready = asyncio.Event()
+
     def _on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info("SUBSCRIBED to audio track from %s (%s)", participant.identity, participant.kind)
+            _audio_ready.set()
 
     ctx.room.on("track_subscribed", _on_track_subscribed)
 
@@ -303,18 +309,49 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         for pub in p.track_publications.values():
             if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
                 logger.info("ALREADY subscribed to audio from %s", p.identity)
+                _audio_ready.set()
 
-    # Always force a greeting turn to ensure the audio path is 'warmed up'
-    await asyncio.sleep(0.5)
-    greeting = (
-        f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
-        if phone_number else "Hello? Can you hear me? Greet the caller warmly."
+    # Wait for the SIP audio track to be established (up to 5s)
+    try:
+        await asyncio.wait_for(_audio_ready.wait(), timeout=5.0)
+        await _log("info", "Audio track ready — proceeding with greeting")
+    except asyncio.TimeoutError:
+        await _log("warning", "Audio track not detected within 5s — proceeding anyway")
+
+    # Small buffer for audio pipeline to fully stabilize
+    await asyncio.sleep(0.8)
+
+    # Force a greeting — use session.say() as reliable fallback since
+    # generate_reply() is incompatible with gemini-3.1-flash-live-preview
+    greeting_text = (
+        f"Jii sir, namaste! {lead_name} jii bol rahe hain kya? Main Priya bol rahi hoon, {business_name} se. Kya aap abhi thoda busy hain, ya main aapka bas 2 minute le sakti hoon?"
+        if phone_number else f"Namaste! Main Priya bol rahi hoon, {business_name} se. Main aapki kaise madad kar sakti hoon?"
     )
     try:
-        await _log("info", "Requesting initial greeting turn...")
-        await session.generate_reply(instructions=greeting)
-    except Exception as _gr_exc:
-        await _log("warning", f"generate_reply failed: {_gr_exc}")
+        await _log("info", "Sending greeting via session.say()...")
+        await session.say(greeting_text, allow_interruptions=True)
+        await _log("info", "Greeting delivered successfully")
+    except AttributeError:
+        # Older SDK version without session.say — try generate_reply as fallback
+        await _log("warning", "session.say() not available — trying generate_reply fallback")
+        try:
+            greeting_instr = (
+                f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
+                if phone_number else "Hello? Can you hear me? Greet the caller warmly."
+            )
+            await session.generate_reply(instructions=greeting_instr)
+        except Exception as _gr_exc:
+            await _log("error", f"All greeting methods failed: {_gr_exc}")
+    except Exception as _say_exc:
+        await _log("warning", f"session.say() failed: {_say_exc} — trying generate_reply fallback")
+        try:
+            greeting_instr = (
+                f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
+                if phone_number else "Hello? Can you hear me? Greet the caller warmly."
+            )
+            await session.generate_reply(instructions=greeting_instr)
+        except Exception as _gr_exc:
+            await _log("error", f"All greeting methods failed: {_gr_exc}")
 
     # ── Keep session alive until SIP participant leaves ───────────────────────
     if phone_number:
