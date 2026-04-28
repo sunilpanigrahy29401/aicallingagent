@@ -213,6 +213,11 @@ async def get_all_calls(page: int = 1, limit: int = 20) -> list:
     result = await db.table("call_logs").select("*").order("timestamp", desc=True).range(offset, offset + limit - 1).execute()
     return result.data or []
 
+async def get_call(call_id: str) -> Optional[dict]:
+    db = await _adb()
+    result = await db.table("call_logs").select("*").eq("id", call_id).maybe_single().execute()
+    return result.data
+
 async def get_calls_by_phone(phone: str) -> list:
     db = await _adb()
     result = await db.table("call_logs").select("*").eq("phone_number", phone).order("timestamp", desc=True).execute()

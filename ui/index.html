@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -639,7 +639,7 @@ async function loadCalls(page=1) {
     let h = `<table><thead><tr><th>Time</th><th>Phone / Lead</th><th>Outcome / Reason</th><th>Duration</th><th>Action</th></tr></thead><tbody>`;
     calls.forEach(c => {
       const dt = new Date(c.timestamp).toLocaleString();
-      const rec = c.recording_url ? `<a href="${c.recording_url}" target="_blank" style="font-size:16px" title="Recording">🔊</a>` : '';
+      const rec = c.recording_url ? `<a href="/api/recordings/${c.id}" target="_blank" style="font-size:16px" title="Recording">🔊</a>` : '';
       h += `<tr>
         <td style="font-size:11px;color:var(--text2)">${dt}</td>
         <td><div style="font-weight:600">${c.phone_number}</div><div style="font-size:11px;color:var(--text2)">${c.lead_name||'--'}</div></td>

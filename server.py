@@ -13,8 +13,10 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
+import boto3
+from urllib.parse import urlparse
 
 _orig_ssl = ssl.create_default_context
 def _certifi_ssl(purpose=ssl.Purpose.SERVER_AUTH, **kwargs):
@@ -27,7 +29,7 @@ from db import (
     SENSITIVE_KEYS, cancel_appointment, clear_errors, create_campaign, delete_campaign,
     get_all_appointments, get_all_calls, get_all_campaigns, get_all_settings,
     get_all_agent_profiles, get_agent_profile, create_agent_profile, update_agent_profile,
-    delete_agent_profile, set_default_agent_profile, get_calls_by_phone, get_campaign,
+    delete_agent_profile, set_default_agent_profile, get_calls_by_phone, get_campaign, get_call,
     get_contacts, get_errors, get_logs, get_setting, get_stats, init_db, log_error,
     save_settings, set_setting, update_call_notes, update_campaign_run_stats, update_campaign_status,
 )
@@ -180,6 +182,60 @@ async def api_dispatch_call(req: CallRequest):
 
 
 # ── Calls ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/recordings/{call_id}")
+async def api_get_recording(call_id: str):
+    call = await get_call(call_id)
+    if not call or not call.get("recording_url"):
+        raise HTTPException(404, "Recording not found")
+        
+    url = call["recording_url"]
+    
+    aws_key = await eff("S3_ACCESS_KEY_ID") or await eff("AWS_ACCESS_KEY_ID")
+    aws_secret = await eff("S3_SECRET_ACCESS_KEY") or await eff("AWS_SECRET_ACCESS_KEY")
+    region = await eff("S3_REGION") or await eff("AWS_REGION") or "us-east-1"
+    endpoint_url = await eff("S3_ENDPOINT_URL") or await eff("S3_ENDPOINT")
+    
+    if not aws_key or not aws_secret:
+        return RedirectResponse(url)
+        
+    try:
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret,
+            region_name=region,
+            endpoint_url=endpoint_url if endpoint_url else None
+        )
+        
+        bucket = await eff("S3_BUCKET") or await eff("AWS_BUCKET_NAME")
+        
+        if url.startswith("s3://"):
+            parts = url.replace("s3://", "").split("/", 1)
+            if not bucket:
+                bucket = parts[0]
+            key = parts[1] if len(parts) > 1 else ""
+        else:
+            parsed = urlparse(url)
+            path_parts = parsed.path.lstrip("/").split("/", 1)
+            if not bucket:
+                bucket = path_parts[0]
+                key = path_parts[1] if len(path_parts) > 1 else ""
+            else:
+                if path_parts[0] == bucket:
+                    key = path_parts[1] if len(path_parts) > 1 else ""
+                else:
+                    key = parsed.path.lstrip("/")
+
+        presigned_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=3600
+        )
+        return RedirectResponse(presigned_url)
+    except Exception as exc:
+        logger.error(f"Failed to generate presigned URL: {exc}")
+        return RedirectResponse(url)
 
 @app.get("/api/calls")
 async def api_get_calls(page: int = 1, limit: int = 20):

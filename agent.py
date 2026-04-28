@@ -4,6 +4,7 @@ import logging
 import os
 import ssl
 import certifi
+import time
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ except ImportError:
     _HAS_ROOM_OPTIONS = False
 from livekit.plugins import noise_cancellation, silero
 
-from db import init_db, log_error, get_enabled_tools
+from db import init_db, log_error, get_enabled_tools, log_call
 from prompts import build_prompt
 from tools import AppointmentTools
 
@@ -227,31 +228,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
     await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
 
-    # ── Dial — MUST come before session.start() ──────────────────────────────
-    if phone_number:
-        trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
-        if not trunk_id:
-            await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
-            ctx.shutdown()
-            return
-        await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id}")
-        try:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}",
-                    wait_until_answered=True,
-                )
-            )
-        except Exception as exc:
-            await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
-            ctx.shutdown()
-            return
-        await _log("info", f"Call ANSWERED — {phone_number} picked up")
-
-    # ── Build and start Gemini Live ──────────────────────────────────────────
+    # ── Build and start Gemini Live BEFORE dialing ───────────────────────────
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     await _log("info", f"Building AI session — model={gemini_model}")
     active_tools = tool_ctx.build_tool_list(enabled_tools)
@@ -278,7 +255,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     try:
         await session.start(**_session_kwargs)
-        await _log("info", "Agent session started — AI ready")
+        await _log("info", "Agent session started — AI ready (waiting for pickup)")
     except Exception as _start_exc:
         await _log("error", f"session.start() FAILED: {_start_exc}")
         ctx.shutdown()
@@ -325,6 +302,30 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             except Exception as _exc:
                 await _log("warning", f"Recording start failed (non-fatal): {_exc}")
 
+    # ── Dial — Blocks until answered ──────────────────────────────────────────
+    if phone_number:
+        trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
+        if not trunk_id:
+            await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
+            ctx.shutdown()
+            return
+        await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id}")
+        try:
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=phone_number,
+                    participant_identity=f"sip_{phone_number}",
+                    wait_until_answered=True,
+                )
+            )
+        except Exception as exc:
+            await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+            ctx.shutdown()
+            return
+        await _log("info", f"Call ANSWERED — {phone_number} picked up")
+
     # ── Greeting & Audio Debug ───────────────────────────────────────────────
     _audio_ready = asyncio.Event()
 
@@ -352,8 +353,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Small buffer for audio pipeline to fully stabilize
     await asyncio.sleep(0.8)
 
-    # Force a greeting — use session.say() as reliable fallback since
-    # generate_reply() is incompatible with gemini-3.1-flash-live-preview
+    # Force a greeting — use session.say() as reliable fallback
     greeting_text = (
         f"Jii sir, namaste! {lead_name} jii bol rahe hain kya? Main Priya bol rahi hoon, {business_name} se. Kya aap abhi thoda busy hain, ya main aapka bas 2 minute le sakti hoon?"
         if phone_number else f"Namaste! Main Priya bol rahi hoon, {business_name} se. Main aapki kaise madad kar sakti hoon?"
@@ -363,7 +363,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await session.say(greeting_text, allow_interruptions=True)
         await _log("info", "Greeting delivered successfully")
     except AttributeError:
-        # Older SDK version without session.say — try generate_reply as fallback
         await _log("warning", "session.say() not available — trying generate_reply fallback")
         try:
             greeting_instr = (
@@ -404,6 +403,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             await _log("warning", "Call reached 1-hour safety timeout")
 
         await _log("info", f"SIP participant disconnected — ending session for {phone_number}")
+        
+        if not getattr(tool_ctx, "call_logged", False):
+            duration = int(time.time() - tool_ctx._call_start_time)
+            try:
+                await log_call(
+                    phone_number=phone_number,
+                    lead_name=lead_name, outcome="no_answer", reason="Call disconnected before AI could finalize",
+                    duration_seconds=duration, recording_url=tool_ctx.recording_url,
+                )
+                await _log("info", "Auto-logged call on disconnect")
+            except Exception as e:
+                await _log("error", f"Auto call log failed: {e}")
+
         await session.aclose()
     else:
         _done = asyncio.Event()

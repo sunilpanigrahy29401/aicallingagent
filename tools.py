@@ -33,6 +33,7 @@ class AppointmentTools:
         self._call_start_time = time.time()
         self._sip_domain = os.getenv("VOBIZ_SIP_DOMAIN", "")
         self.recording_url: Optional[str] = None
+        self.call_logged: bool = False
 
     def build_tool_list(self, enabled: list) -> list:
         """Return tool methods filtered by the enabled list. Empty list = all enabled."""
@@ -83,6 +84,7 @@ class AppointmentTools:
         reason: brief description
         """
         duration = int(time.time() - self._call_start_time)
+        self.call_logged = True
         try:
             await log_call(
                 phone_number=self.phone_number or "unknown",
