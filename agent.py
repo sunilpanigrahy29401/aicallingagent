@@ -353,35 +353,18 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Small buffer for audio pipeline to fully stabilize
     await asyncio.sleep(0.8)
 
-    # Force a greeting — use session.say() as reliable fallback
-    greeting_text = (
-        f"Jii sir, namaste! {lead_name} jii bol rahe hain kya? Main Priya bol rahi hoon, {business_name} se. Kya aap abhi thoda busy hain, ya main aapka bas 2 minute le sakti hoon?"
+    # Force a greeting turn. We use generate_reply with explicit text as instructions.
+    # This is more compatible with the Gemini Live model than session.say().
+    greeting_instr = (
+        f"The call just connected. Speak exactly this greeting in a warm, professional female voice: 'Jii sir, namaste! {lead_name} jii bol rahe hain kya? Main Priya bol rahi hoon, {business_name} se. Kya aap abhi thoda busy hain, ya main aapka bas 2 minute le sakti hoon?'"
         if phone_number else f"Namaste! Main Priya bol rahi hoon, {business_name} se. Main aapki kaise madad kar sakti hoon?"
     )
     try:
-        await _log("info", "Sending greeting via session.say()...")
-        await session.say(greeting_text, allow_interruptions=True)
-        await _log("info", "Greeting delivered successfully")
-    except AttributeError:
-        await _log("warning", "session.say() not available — trying generate_reply fallback")
-        try:
-            greeting_instr = (
-                f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
-                if phone_number else "Hello? Can you hear me? Greet the caller warmly."
-            )
-            await session.generate_reply(instructions=greeting_instr)
-        except Exception as _gr_exc:
-            await _log("error", f"All greeting methods failed: {_gr_exc}")
-    except Exception as _say_exc:
-        await _log("warning", f"session.say() failed: {_say_exc} — trying generate_reply fallback")
-        try:
-            greeting_instr = (
-                f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
-                if phone_number else "Hello? Can you hear me? Greet the caller warmly."
-            )
-            await session.generate_reply(instructions=greeting_instr)
-        except Exception as _gr_exc:
-            await _log("error", f"All greeting methods failed: {_gr_exc}")
+        await _log("info", "Requesting initial greeting turn...")
+        await session.generate_reply(instructions=greeting_instr)
+        await _log("info", "Greeting requested successfully")
+    except Exception as _gr_exc:
+        await _log("error", f"Greeting failed: {_gr_exc}")
 
     # ── Keep session alive until SIP participant leaves ───────────────────────
     if phone_number:
