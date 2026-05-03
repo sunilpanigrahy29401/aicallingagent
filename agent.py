@@ -317,26 +317,47 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             except Exception as _exc:
                 await _log("warning", f"Recording start failed (non-fatal): {_exc}")
 
-    # ── Dial — Blocks until answered ──────────────────────────────────────────
+    # ── Dial — Blocks until answered (with retry for transient SIP errors) ─────
     if phone_number:
         trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
         if not trunk_id:
             await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
             ctx.shutdown()
             return
-        await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id}")
-        try:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}",
-                    wait_until_answered=True,
+        
+        _max_retries = 3
+        _retry_delay = 5  # seconds between retries
+        _dial_success = False
+        _last_exc = None
+        
+        for _attempt in range(1, _max_retries + 1):
+            await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id} (attempt {_attempt}/{_max_retries})")
+            try:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=phone_number,
+                        participant_identity=f"sip_{phone_number}",
+                        wait_until_answered=True,
+                    )
                 )
-            )
-        except Exception as exc:
-            exc_str = str(exc)
+                _dial_success = True
+                break
+            except Exception as exc:
+                _last_exc = exc
+                exc_str = str(exc)
+                # Retry only on transient errors (busy/unavailable/terminated)
+                _is_transient = any(code in exc_str for code in ("486", "480", "487", "Busy", "Unavailable", "Terminated"))
+                if _is_transient and _attempt < _max_retries:
+                    await _log("warning", f"SIP dial attempt {_attempt} got transient error: {exc_str[:150]} — retrying in {_retry_delay}s...")
+                    await asyncio.sleep(_retry_delay)
+                    continue
+                else:
+                    break
+        
+        if not _dial_success:
+            exc_str = str(_last_exc)
             # Parse SIP status to determine the right outcome for dashboard
             if "486" in exc_str or "Busy" in exc_str:
                 _outcome, _reason = "busy", "Line was busy"
@@ -353,7 +374,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             else:
                 _outcome, _reason = "no_answer", f"SIP error: {exc_str[:200]}"
             
-            await _log("warning", f"SIP dial failed for {phone_number}: {_outcome} — {_reason}")
+            await _log("warning", f"SIP dial failed for {phone_number} after {_max_retries} attempts: {_outcome} — {_reason}")
             try:
                 duration = int(time.time() - tool_ctx._call_start_time)
                 await log_call(
