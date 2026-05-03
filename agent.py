@@ -336,7 +336,34 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 )
             )
         except Exception as exc:
-            await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+            exc_str = str(exc)
+            # Parse SIP status to determine the right outcome for dashboard
+            if "486" in exc_str or "Busy" in exc_str:
+                _outcome, _reason = "busy", "Line was busy"
+            elif "480" in exc_str or "Unavailable" in exc_str:
+                _outcome, _reason = "no_answer", "Temporarily unavailable"
+            elif "487" in exc_str or "Terminated" in exc_str:
+                _outcome, _reason = "no_answer", "Call was cancelled/terminated"
+            elif "408" in exc_str or "Timeout" in exc_str:
+                _outcome, _reason = "no_answer", "No answer (timeout)"
+            elif "603" in exc_str or "Decline" in exc_str:
+                _outcome, _reason = "not_interested", "Call declined by recipient"
+            elif "404" in exc_str or "Not Found" in exc_str:
+                _outcome, _reason = "wrong_number", "Number not found"
+            else:
+                _outcome, _reason = "no_answer", f"SIP error: {exc_str[:200]}"
+            
+            await _log("warning", f"SIP dial failed for {phone_number}: {_outcome} — {_reason}")
+            try:
+                duration = int(time.time() - tool_ctx._call_start_time)
+                await log_call(
+                    phone_number=phone_number, lead_name=lead_name,
+                    outcome=_outcome, reason=_reason,
+                    duration_seconds=duration, recording_url=None,
+                )
+                tool_ctx.call_logged = True
+            except Exception as _log_exc:
+                await _log("error", f"Failed to log dial failure: {_log_exc}")
             ctx.shutdown()
             return
         await _log("info", f"Call ANSWERED — {phone_number} picked up")
