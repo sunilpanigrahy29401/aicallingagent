@@ -261,8 +261,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         ctx.shutdown()
         return
 
-    # Give the realtime session time to fully initialize its audio pipeline
-    await asyncio.sleep(1.0)
 
     @session.on("agent_started_speaking")
     def _on_agent_start():
@@ -276,7 +274,24 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     def _on_user_start():
         logger.info("USER started speaking (detected by VAD)")
 
-    # ── Optional S3 recording ────────────────────────────────────────────────
+    # ── Set up audio listener BEFORE dialing so we catch the track instantly ──
+    _audio_ready = asyncio.Event()
+
+    def _on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info("SUBSCRIBED to audio track from %s (%s)", participant.identity, participant.kind)
+            _audio_ready.set()
+
+    ctx.room.on("track_subscribed", _on_track_subscribed)
+
+    # Check for existing audio tracks
+    for p in ctx.room.remote_participants.values():
+        for pub in p.track_publications.values():
+            if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info("ALREADY subscribed to audio from %s", p.identity)
+                _audio_ready.set()
+
+    # ── Optional S3 recording (start before dial so it captures the full call) ─
     if phone_number:
         _aws_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
         _aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -326,35 +341,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             return
         await _log("info", f"Call ANSWERED — {phone_number} picked up")
 
-    # ── Greeting & Audio Debug ───────────────────────────────────────────────
-    _audio_ready = asyncio.Event()
-
-    def _on_track_subscribed(track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant):
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info("SUBSCRIBED to audio track from %s (%s)", participant.identity, participant.kind)
-            _audio_ready.set()
-
-    ctx.room.on("track_subscribed", _on_track_subscribed)
-
-    # Check for existing audio tracks
-    for p in ctx.room.remote_participants.values():
-        for pub in p.track_publications.values():
-            if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
-                logger.info("ALREADY subscribed to audio from %s", p.identity)
-                _audio_ready.set()
-
-    # Wait for the SIP audio track to be established (up to 5s)
+    # ── Instant greeting — fire IMMEDIATELY after pickup ──────────────────────
+    # Wait briefly for the SIP audio track (max 2s — usually instant since
+    # the listener was registered before dialing)
     try:
-        await asyncio.wait_for(_audio_ready.wait(), timeout=5.0)
-        await _log("info", "Audio track ready — proceeding with greeting")
+        await asyncio.wait_for(_audio_ready.wait(), timeout=2.0)
+        await _log("info", "Audio track ready — greeting now")
     except asyncio.TimeoutError:
-        await _log("warning", "Audio track not detected within 5s — proceeding anyway")
+        await _log("warning", "Audio track not detected within 2s — greeting anyway")
 
-    # Small buffer for audio pipeline to fully stabilize
-    await asyncio.sleep(0.8)
-
-    # Force a greeting turn. We use generate_reply with explicit text as instructions.
-    # This is more compatible with the Gemini Live model than session.say().
+    # NO extra sleep — greet immediately!
     greeting_instr = (
         f"The call just connected. Speak exactly this greeting in a warm, professional female voice: 'Jii sir, namaste! {lead_name} jii bol rahe hain kya? Main Priya bol rahi hoon, {business_name} se. Kya aap abhi thoda busy hain, ya main aapka bas 2 minute le sakti hoon?'"
         if phone_number else f"Namaste! Main Priya bol rahi hoon, {business_name} se. Main aapki kaise madad kar sakti hoon?"
